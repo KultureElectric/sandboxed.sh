@@ -365,6 +365,9 @@ pub struct SaveWorkspaceTemplateRequest {
     /// Config profile to use for workspaces created from this template.
     #[serde(default)]
     pub config_profile: Option<String>,
+    /// Per-backend config overlays (see `Workspace::agent_config_overlays`).
+    #[serde(default)]
+    pub agent_config_overlays: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1204,6 +1207,7 @@ async fn save_workspace_template(
         tailscale_mode: req.tailscale_mode,
         mcps: req.mcps.unwrap_or_default(),
         config_profile: req.config_profile.clone(),
+        agent_config_overlays: req.agent_config_overlays.unwrap_or_default(),
     };
 
     library

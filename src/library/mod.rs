@@ -60,6 +60,9 @@ struct WorkspaceTemplateConfig {
     /// Config profile to use for workspaces created from this template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     config_profile: Option<String>,
+    /// Per-backend config overlays (see `Workspace::agent_config_overlays`).
+    #[serde(default)]
+    agent_config_overlays: HashMap<String, serde_json::Value>,
 }
 
 // Directory constants (OpenCode-aligned structure)
@@ -1266,6 +1269,7 @@ impl LibraryStore {
             tailscale_mode: config.tailscale_mode,
             mcps: config.mcps,
             config_profile: config.config_profile,
+            agent_config_overlays: config.agent_config_overlays,
         })
     }
 
@@ -1318,6 +1322,7 @@ impl LibraryStore {
             tailscale_mode: template.tailscale_mode,
             mcps: template.mcps.clone(),
             config_profile: template.config_profile.clone(),
+            agent_config_overlays: template.agent_config_overlays.clone(),
         };
 
         let content = serde_json::to_string_pretty(&config)?;

@@ -86,6 +86,9 @@ pub struct CreateWorkspaceRequest {
     pub mcps: Vec<String>,
     /// Optional config profile to apply to this workspace.
     pub config_profile: Option<String>,
+    /// Per-backend config overlays (see `Workspace::agent_config_overlays`).
+    #[serde(default)]
+    pub agent_config_overlays: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +118,8 @@ pub struct UpdateWorkspaceRequest {
     pub mcps: Option<Vec<String>>,
     /// Optional config profile to apply to this workspace.
     pub config_profile: Option<String>,
+    /// Per-backend config overlays (see `Workspace::agent_config_overlays`).
+    pub agent_config_overlays: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +142,7 @@ pub struct WorkspaceResponse {
     pub tailscale_mode: Option<TailscaleMode>,
     pub mcps: Vec<String>,
     pub config_profile: Option<String>,
+    pub agent_config_overlays: HashMap<String, serde_json::Value>,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -160,6 +166,7 @@ impl From<Workspace> for WorkspaceResponse {
             tailscale_mode: w.tailscale_mode,
             mcps: w.mcps,
             config_profile: w.config_profile,
+            agent_config_overlays: w.agent_config_overlays,
         }
     }
 }
@@ -424,6 +431,18 @@ async fn create_workspace(
         }
     }
 
+    // Agent config overlays: template provides the base, request merges on top
+    let mut agent_config_overlays = template_data
+        .as_ref()
+        .map(|t| t.agent_config_overlays.clone())
+        .unwrap_or_default();
+    for (backend, overlay) in req.agent_config_overlays {
+        let entry = agent_config_overlays
+            .entry(backend)
+            .or_insert(serde_json::Value::Object(Default::default()));
+        workspace::merge_json(entry, &overlay);
+    }
+
     let mut workspace = match workspace_type {
         WorkspaceType::Host => Workspace {
             id: Uuid::new_v4(),
@@ -445,6 +464,7 @@ async fn create_workspace(
             tailscale_mode,
             mcps: mcps.clone(),
             config_profile: config_profile.clone(),
+            agent_config_overlays: agent_config_overlays.clone(),
         },
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);
@@ -459,6 +479,7 @@ async fn create_workspace(
             ws.tailscale_mode = tailscale_mode;
             ws.mcps = mcps;
             ws.config_profile = config_profile;
+            ws.agent_config_overlays = agent_config_overlays;
             ws
         }
     };
@@ -636,6 +657,12 @@ async fn update_workspace(
         } else {
             workspace.config_profile = Some(trimmed.to_string());
         }
+    }
+
+    // Update agent_config_overlays: null clears, otherwise replace entirely.
+    // Callers that want to merge incrementally should GET the current value first.
+    if let Some(overlays) = req.agent_config_overlays {
+        workspace.agent_config_overlays = overlays;
     }
 
     // Save the updated workspace

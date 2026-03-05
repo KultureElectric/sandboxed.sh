@@ -174,6 +174,23 @@ pub struct Workspace {
     /// Defaults to "default" if not specified.
     #[serde(default)]
     pub config_profile: Option<String>,
+    /// Per-backend config overlays, deep-merged into the generated agent config
+    /// before each mission. Keys are backend IDs (e.g. "claudecode", "amp",
+    /// "opencode"). Values are arbitrary JSON objects that are deep-merged
+    /// (objects recurse, arrays concatenate, scalars override).
+    ///
+    /// Example — inject a Langfuse stop hook for Claude Code:
+    /// ```json
+    /// {
+    ///   "claudecode": {
+    ///     "hooks": {
+    ///       "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "langfuse-upload ..."}]}]
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    #[serde(default)]
+    pub agent_config_overlays: HashMap<String, serde_json::Value>,
 }
 
 impl Workspace {
@@ -199,6 +216,7 @@ impl Workspace {
             tailscale_mode: None,
             mcps: Vec::new(),
             config_profile: None,
+            agent_config_overlays: HashMap::new(),
         }
     }
 
@@ -224,6 +242,7 @@ impl Workspace {
             shared_network: None,
             tailscale_mode: None,
             mcps: Vec::new(),
+            agent_config_overlays: HashMap::new(),
         }
     }
 }
@@ -415,6 +434,7 @@ impl WorkspaceStore {
                     tailscale_mode: None,
                     mcps: Vec::new(),
                     config_profile: None,
+                    agent_config_overlays: HashMap::new(),
                 };
 
                 orphaned.push(workspace);
@@ -1414,6 +1434,7 @@ async fn write_claudecode_config(
     skill_contents: Option<&[SkillContent]>,
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
+    overlay: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     // Create .claude directory
     let claude_dir = workspace_dir.join(".claude");
@@ -1485,6 +1506,12 @@ async fn write_claudecode_config(
             .as_object_mut()
             .unwrap()
             .insert("hooks".to_string(), hooks);
+    }
+
+    // Apply workspace-level config overlay (deep-merged on top of generated settings).
+    // Runs after RTK so overlay can extend RTK hooks via array concatenation.
+    if let Some(o) = overlay {
+        merge_json(&mut settings, o);
     }
 
     let settings_path = claude_dir.join("settings.local.json");
@@ -1563,6 +1590,26 @@ async fn write_claudecode_config(
     Ok(())
 }
 
+/// Deep-merge `overlay` into `base`.
+///
+/// Merge rules:
+/// - Objects: recurse — overlay keys win for scalars, both sides merged for objects/arrays.
+/// - Arrays: concatenate (base first, overlay appended) so existing entries are preserved.
+/// - Scalars / type mismatch: overlay replaces base.
+pub fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                merge_json(b.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (serde_json::Value::Array(b), serde_json::Value::Array(o)) => {
+            b.extend(o.iter().cloned());
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
 /// Write Amp configuration to the workspace.
 /// Generates `AGENTS.md`, `.agents/skills/`, and optionally `settings.json`.
 async fn write_amp_config(
@@ -1573,6 +1620,7 @@ async fn write_amp_config(
     workspace_env: &HashMap<String, String>,
     skill_contents: Option<&[SkillContent]>,
     _shared_network: Option<bool>,
+    overlay: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     // Create .agents directory for skills
     let agents_dir = workspace_dir.join(".agents");
@@ -1604,9 +1652,9 @@ async fn write_amp_config(
         );
     }
 
-    // Write settings.json if we have MCP servers or need permissions
-    if !mcp_servers.is_empty() {
-        let settings = json!({
+    // Write settings.json if we have MCP servers, need permissions, or have an overlay
+    if !mcp_servers.is_empty() || overlay.is_some() {
+        let mut settings = json!({
             "amp.mcpServers": mcp_servers,
             "amp.permissions": [
                 // Allow all bash commands in managed workspaces
@@ -1619,6 +1667,9 @@ async fn write_amp_config(
                 { "tool": "mcp__*", "action": "allow" }
             ]
         });
+        if let Some(o) = overlay {
+            merge_json(&mut settings, o);
+        }
         let settings_path = workspace_dir.join("settings.json");
         let settings_content = serde_json::to_string_pretty(&settings)?;
         tokio::fs::write(&settings_path, settings_content).await?;
@@ -2135,6 +2186,7 @@ pub async fn write_backend_config(
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
     custom_providers: Option<&[AIProvider]>,
+    agent_config_overlays: Option<&HashMap<String, serde_json::Value>>,
 ) -> anyhow::Result<()> {
     match backend_id {
         "opencode" => {
@@ -2152,6 +2204,7 @@ pub async fn write_backend_config(
             .await
         }
         "claudecode" => {
+            let overlay = agent_config_overlays.and_then(|m| m.get("claudecode"));
             // Keep OpenCode config in sync for compatibility with existing execution pipeline.
             write_opencode_config(
                 workspace_dir,
@@ -2174,10 +2227,12 @@ pub async fn write_backend_config(
                 skill_contents,
                 command_contents,
                 shared_network,
+                overlay,
             )
             .await
         }
         "amp" => {
+            let overlay = agent_config_overlays.and_then(|m| m.get("amp"));
             write_amp_config(
                 workspace_dir,
                 mcp_configs,
@@ -2186,6 +2241,7 @@ pub async fn write_backend_config(
                 workspace_env,
                 skill_contents,
                 shared_network,
+                overlay,
             )
             .await
         }
@@ -3267,6 +3323,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         command_contents.as_deref(),
         workspace.shared_network,
         effective_custom_providers,
+        Some(&workspace.agent_config_overlays),
     )
     .await?;
 
@@ -4460,5 +4517,69 @@ fn patch_opencode_agent_models_for_oauth(content: &str) -> String {
         serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string())
     } else {
         content.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merge_json_objects_deep_merge() {
+        let mut base = json!({"a": 1, "b": {"x": 1, "y": 2}});
+        let overlay = json!({"b": {"y": 99, "z": 3}, "c": 4});
+        merge_json(&mut base, &overlay);
+        assert_eq!(base["a"], 1);
+        assert_eq!(base["b"]["x"], 1);
+        assert_eq!(base["b"]["y"], 99); // overlay wins
+        assert_eq!(base["b"]["z"], 3);  // new key added
+        assert_eq!(base["c"], 4);       // new key added
+    }
+
+    #[test]
+    fn merge_json_arrays_concatenate() {
+        let mut base = json!({"hooks": {"Stop": ["a", "b"]}});
+        let overlay = json!({"hooks": {"Stop": ["c"]}});
+        merge_json(&mut base, &overlay);
+        let arr = base["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], "a");
+        assert_eq!(arr[2], "c");
+    }
+
+    #[test]
+    fn merge_json_scalar_overlay_wins() {
+        let mut base = json!({"model": "claude-3"});
+        let overlay = json!({"model": "claude-opus-4"});
+        merge_json(&mut base, &overlay);
+        assert_eq!(base["model"], "claude-opus-4");
+    }
+
+    #[test]
+    fn merge_json_empty_overlay_no_change() {
+        let mut base = json!({"a": 1});
+        let overlay = json!({});
+        merge_json(&mut base, &overlay);
+        assert_eq!(base["a"], 1);
+    }
+
+    #[test]
+    fn merge_json_overlay_adds_hooks_to_permissions() {
+        // Simulates the Langfuse use-case: merging a Stop hook into Claude settings
+        let mut settings = json!({
+            "mcpServers": {},
+            "permissions": {"allow": ["Bash", "Read"]}
+        });
+        let overlay = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "langfuse-upload"}]}]
+            }
+        });
+        merge_json(&mut settings, &overlay);
+        assert!(settings["hooks"]["Stop"].is_array());
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["command"], "langfuse-upload");
+        // Original permissions untouched
+        assert_eq!(settings["permissions"]["allow"][0], "Bash");
     }
 }

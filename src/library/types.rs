@@ -183,6 +183,10 @@ pub struct WorkspaceTemplate {
     /// Defaults to "default" if not specified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_profile: Option<String>,
+    /// Per-backend config overlays applied to workspaces created from this template.
+    /// See `Workspace::agent_config_overlays` for the merge semantics.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_config_overlays: HashMap<String, serde_json::Value>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
